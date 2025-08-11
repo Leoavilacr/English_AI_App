@@ -1,14 +1,14 @@
-// LiveSession.jsx
+// LiveSession.jsx (continuous listening with auto-start after greeting TTS)
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useNavigate, useLocation } from 'react-router-dom';
 
 const LiveSession = () => {
   const { state } = useLocation();
-  const { level, topic } = state || {};
+  const { level, topic, googleId } = state || {};
   const [messages, setMessages] = useState([]);
   const [isListening, setIsListening] = useState(false);
-  const [listenHint, setListenHint] = useState(''); // estado de depuración visible
+  const [listenHint, setListenHint] = useState('');
   const [sessionId] = useState(uuidv4());
   const [timeLeft, setTimeLeft] = useState(300);
   const [conversationOver, setConversationOver] = useState(false);
@@ -17,27 +17,68 @@ const LiveSession = () => {
 
   const hasWelcomedRef = useRef(false);
   const recognitionRef = useRef(null);
+  const isListeningRef = useRef(false);
+  const manualStopRef = useRef(false);
+
   const timerRef = useRef(null);
-  const watchdogRef = useRef(null); // timeout para detectar silencio sin onresult
+  const watchdogRef = useRef(null);
+
+  // Continuous STT buffers y timers
+  const continuousMode = true;               // 👈 modo continuo habilitado
+  const SILENCE_MS = 1000;                   // umbral de silencio para "enviar"
+  const silenceTimerRef = useRef(null);
+  const partialRef = useRef('');             // última transcripción parcial
+  const finalRef = useRef('');               // acumulado final de la frase actual
+  const lastSentRef = useRef('');            // para deduplicar
+  const sendingRef = useRef(false);          // evita overlaps de requests
+
+  const normalize = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s']/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  // --- Auto-start después del TTS de bienvenida ---
+  const autoStartAfterGreetingRef = useRef(false);
 
   // --- Audio (cola simple para evitar solapes) ---
   const audioRef = useRef(null);
   const queueRef = useRef([]);
   const isPlayingRef = useRef(false);
+  const pausedByTTSRef = useRef(false);      // si pausamos el mic por TTS
 
   const durations = { A1: 300, A2: 360, B1: 420, B2: 480, C1: 600 };
   const totalDuration = durations[level] || 300;
 
-  // ======= TTS por /api/tts (reemplazo de speechSynthesis) =======
+  // ======= TTS por /api/tts (pausa/reanuda mic para evitar eco) =======
+  const pauseRecognitionForTTS = useCallback(() => {
+    if (!recognitionRef.current) return;
+    if (!isListeningRef.current) return;
+    try {
+      pausedByTTSRef.current = true;
+      recognitionRef.current.stop();
+    } catch {}
+  }, []);
+
+  const resumeRecognitionAfterTTS = useCallback(() => {
+    if (!continuousMode || conversationOver) return;
+    if (!recognitionRef.current) return;
+    if (manualStopRef.current) return;
+    try {
+      setTimeout(() => {
+        try { recognitionRef.current.start(); } catch {}
+      }, 200);
+    } catch {}
+  }, [conversationOver]);
+
   const stopAllAudio = useCallback(() => {
     try {
-      // Pausa audio actual
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.src = '';
         audioRef.current.load?.();
       }
-      // Vacía cola
       queueRef.current.forEach((url) => URL.revokeObjectURL(url));
       queueRef.current = [];
       isPlayingRef.current = false;
@@ -46,28 +87,162 @@ const LiveSession = () => {
     }
   }, []);
 
+  // ======= START continuo (función reutilizable) =======
+  const ensureMicPermission = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+      stream.getTracks().forEach(t => t.stop());
+      return true;
+    } catch (e) {
+      console.warn('Microphone permission denied or failed:', e);
+      return false;
+    }
+  };
+
+  const initializeSpeechRecognition = useCallback(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert('Speech Recognition is not supported in this browser. Try Chrome.');
+      return null;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;    // parciales activos
+    recognition.maxAlternatives = 1;
+    recognition.continuous = true;        // modo continuo
+
+    recognition.onstart = () => {
+      setListenHint('Listening…');
+      setIsListening(true);
+      isListeningRef.current = true;
+      manualStopRef.current = false;
+      clearTimeout(watchdogRef.current);
+      // watchdog de 20s sin eventos para reiniciar
+      watchdogRef.current = setTimeout(() => {
+        try { recognition.stop(); } catch {}
+      }, 20000);
+    };
+
+    recognition.onresult = (event) => {
+      clearTimeout(watchdogRef.current);
+      watchdogRef.current = setTimeout(() => {
+        try { recognition.stop(); } catch {}
+      }, 20000);
+
+      let gotSomething = false;
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const txt = (res[0]?.transcript || '').trim();
+        if (!txt) continue;
+        gotSomething = true;
+
+        if (res.isFinal) {
+          finalRef.current = `${finalRef.current ? finalRef.current + ' ' : ''}${txt}`.trim();
+        } else {
+          partialRef.current = txt;
+        }
+      }
+
+      if (gotSomething) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          commitUtterance();
+        }, SILENCE_MS);
+      }
+    };
+
+    recognition.onerror = (ev) => {
+      clearTimeout(watchdogRef.current);
+      if (continuousMode && ev?.error === 'no-speech' && !manualStopRef.current && !conversationOver) {
+        setTimeout(() => { try { recognition.start(); } catch {} }, 300);
+        return;
+      }
+      setListenHint(ev?.error === 'not-allowed'
+        ? 'Mic blocked. Enable permissions.'
+        : 'Mic error. Tap again.');
+      setIsListening(false);
+      isListeningRef.current = false;
+    };
+
+    recognition.onend = () => {
+      clearTimeout(watchdogRef.current);
+      setIsListening(false);
+      isListeningRef.current = false;
+      if (continuousMode && !manualStopRef.current && !conversationOver) {
+        try { recognition.start(); } catch {}
+      }
+    };
+
+    return recognition;
+  }, [conversationOver, continuousMode]);
+
+  const startContinuousListening = useCallback(async () => {
+    if (conversationOver) return;
+    if (listenHint === 'Processing…') return;
+    if (isListeningRef.current) return;
+
+    stopAllAudio();
+    const ok = await ensureMicPermission();
+    if (!ok) {
+      alert('We need microphone access to practice speaking.');
+      return;
+    }
+
+    const rec = initializeSpeechRecognition();
+    recognitionRef.current = rec;
+    if (!rec) return;
+
+    try {
+      setListenHint('Starting microphone…');
+      rec.start();
+    } catch (e) {
+      console.warn('rec.start() error:', e);
+      setListenHint('Failed to start mic. Try again.');
+    }
+  }, [conversationOver, listenHint, stopAllAudio, initializeSpeechRecognition]);
+
+  // ======= Reproducción de audio (con auto-start tras bienvenida) =======
   const playNextInQueue = useCallback(() => {
     if (isPlayingRef.current) return;
     const next = queueRef.current.shift();
     if (!next) return;
 
     isPlayingRef.current = true;
+    // pausa el mic antes de reproducir para evitar eco
+    pauseRecognitionForTTS();
+
     audioRef.current = new Audio(next);
-    audioRef.current.onended = () => {
+    const onDone = () => {
       URL.revokeObjectURL(next);
       isPlayingRef.current = false;
+
+      // Si venimos del saludo inicial y aún no hay mic, arráncalo
+      if (autoStartAfterGreetingRef.current) {
+        autoStartAfterGreetingRef.current = false;
+        startContinuousListening();
+      } else {
+        // si ya estaba el mic y lo pausamos, reanudar
+        resumeRecognitionAfterTTS();
+      }
+
       playNextInQueue();
     };
-    audioRef.current.onerror = () => {
-      URL.revokeObjectURL(next);
-      isPlayingRef.current = false;
-      playNextInQueue();
-    };
+
+    audioRef.current.onended = onDone;
+    audioRef.current.onerror = onDone;
+
     audioRef.current.play().catch(() => {
-      // Autoplay policies o similar
       isPlayingRef.current = false;
+      if (autoStartAfterGreetingRef.current) {
+        autoStartAfterGreetingRef.current = false;
+        startContinuousListening();
+      } else {
+        resumeRecognitionAfterTTS();
+      }
     });
-  }, []);
+  }, [pauseRecognitionForTTS, resumeRecognitionAfterTTS, startContinuousListening]);
 
   const speakText = useCallback(async (text, voice = 'en-US-Neural2-C') => {
     try {
@@ -83,15 +258,20 @@ const LiveSession = () => {
       playNextInQueue();
     } catch (e) {
       console.error('TTS error:', e);
+      // aunque falle TTS, si esperábamos auto-start, lánzalo
+      if (autoStartAfterGreetingRef.current) {
+        autoStartAfterGreetingRef.current = false;
+        startContinuousListening();
+      } else {
+        resumeRecognitionAfterTTS();
+      }
     }
-  }, [playNextInQueue]);
+  }, [playNextInQueue, resumeRecognitionAfterTTS, startContinuousListening]);
 
-  // ======= Mensaje inicial (StrictMode-safe) =======
+  // ======= Mensaje inicial (StrictMode-safe) + auto-start tras TTS =======
   useEffect(() => {
     if (!level || !topic) return;
     if (hasWelcomedRef.current) return;
-
-    hasWelcomedRef.current = true;
 
     const ac = new AbortController();
     let cancelled = false;
@@ -106,22 +286,28 @@ const LiveSession = () => {
             message: '',
             level,
             topic,
-            isFirstMessage: true,
-            sessionId
+            sessionId,
+            googleId,
+            isFirstMessage: true
           })
         });
-        if (!res.ok) throw new Error('Initial chat request failed');
+        if (!res.ok) {
+          console.error('Initial chat request failed', await res.text());
+          return;
+        }
 
         const data = await res.json();
-        const aiText = data.response || `Let's talk about ${topic}.`;
-
+        const aiText = data?.response || `Let's talk about ${topic}.`;
         if (cancelled) return;
 
         setMessages(prev => (prev.length ? prev : [{ sender: 'ai', text: aiText }]));
+        // marcar que, al terminar este TTS, auto-arranque el mic continuo
+        autoStartAfterGreetingRef.current = true;
         speakText(aiText);
         setTimeLeft(totalDuration);
+        hasWelcomedRef.current = true;
       } catch (err) {
-        if (err.name !== 'AbortError') console.error('Fetch error:', err);
+        if (!cancelled && err.name !== 'AbortError') console.error('Fetch error (welcome):', err);
       }
     })();
 
@@ -129,12 +315,11 @@ const LiveSession = () => {
       cancelled = true;
       ac.abort();
     };
-  }, [level, topic, totalDuration, sessionId, speakText]);
+  }, [level, topic, totalDuration, sessionId, googleId, speakText]);
 
-  // ======= Timer (solo corre cuando realmente se está escuchando) =======
+  // ======= Timer =======
   useEffect(() => {
     if (conversationOver) return;
-
     if (isListening) {
       timerRef.current = setInterval(() => {
         setTimeLeft((t) => {
@@ -149,177 +334,91 @@ const LiveSession = () => {
     } else {
       clearInterval(timerRef.current);
     }
-
     return () => clearInterval(timerRef.current);
   }, [isListening, conversationOver]);
 
-  // ======= Permiso mic =======
-  const ensureMicPermission = async () => {
+  // ======= Commit de la frase cuando hay silencio =======
+  const commitUtterance = useCallback(async () => {
+    clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = null;
+
+    const raw = (finalRef.current || partialRef.current || '').trim();
+    const norm = normalize(raw);
+
+    if (!norm) return;
+    if (norm === lastSentRef.current) return;
+    if (sendingRef.current) return;
+
+    lastSentRef.current = norm;
+    sendingRef.current = true;
+    setListenHint('Processing…');
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // cerramos inmediatamente (solo era para conceder permiso)
-      stream.getTracks().forEach(t => t.stop());
-      return true;
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: raw,
+          level,
+          topic,
+          googleId,
+          sessionId,
+          isFirstMessage: false
+        })
+      });
+      const data = await res.json();
+      const highlightedText = highlightErrors(raw, data.corrected || '');
+      const aiText = data.response || '';
+
+      setMessages((prev) => [
+        ...prev,
+        { sender: 'user', text: highlightedText },
+        { sender: 'ai', text: aiText }
+      ]);
+
+      finalRef.current = '';
+      partialRef.current = '';
+
+      // Reproduce TTS (pausa/reanuda mic según corresponda)
+      speakText(aiText);
+      setListenHint('');
     } catch (e) {
-      console.warn('Microphone permission denied or failed:', e);
-      return false;
+      console.error('Chat fetch error:', e);
+      setListenHint('Network error. Try again.');
+    } finally {
+      sendingRef.current = false;
     }
-  };
+  }, [googleId, level, topic, sessionId, speakText]);
 
-  // ======= STT =======
-  const initializeSpeechRecognition = () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      alert('Speech Recognition is not supported in this browser. Try Chrome.');
-      return null;
-    }
-    const recognition = new SpeechRecognition();
-    recognition.lang = 'en-US';
-    recognition.interimResults = true;   // ayuda a disparar eventos antes
-    recognition.maxAlternatives = 1;
-    recognition.continuous = false;
-
-    recognition.onstart = () => {
-      console.log('[STT] onstart');
-      setListenHint('Listening…');
-      setIsListening(true);
-
-      // Watchdog: si en 8s no llega ningún result, paramos y avisamos
-      clearTimeout(watchdogRef.current);
-      watchdogRef.current = setTimeout(() => {
-        console.warn('[STT] No result within timeout');
-        setListenHint('No voice detected. Try again closer to the mic.');
-        recognition.stop();
-      }, 8000);
-    };
-
-    recognition.onresult = async (event) => {
-      console.log('[STT] onresult');
-      clearTimeout(watchdogRef.current);
-      // Tomamos la última alternativa con isFinal si existe
-      let transcript = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const res = event.results[i];
-        if (res.isFinal) {
-          transcript = res[0]?.transcript || transcript;
-        }
-      }
-      if (!transcript) {
-        // si no hubo final, tomamos la última parcial
-        const last = event.results[event.results.length - 1];
-        transcript = last && last[0] ? last[0].transcript : '';
-      }
-
-      if (!transcript.trim()) {
-        setListenHint('Heard nothing. Try again.');
-        return;
-      }
-
-      try {
-        setListenHint('Processing…');
-        const res = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: transcript,
-            level,
-            topic,
-            sessionId,
-            isFirstMessage: false
-          })
-        });
-        const data = await res.json();
-        const highlightedText = highlightErrors(transcript, data.corrected);
-        const aiText = data.response;
-
-        setMessages((prev) => [
-          ...prev,
-          { sender: 'user', text: highlightedText },
-          { sender: 'ai', text: aiText }
-        ]);
-        speakText(aiText);
-        setListenHint('');
-      } catch (e) {
-        console.error('Chat fetch error:', e);
-        setListenHint('Network error. Try again.');
-      }
-    };
-
-    recognition.onspeechend = () => {
-      console.log('[STT] onspeechend');
-      // dejamos que onend cierre estado
-    };
-
-    recognition.onnomatch = () => {
-      console.log('[STT] onnomatch');
-      setListenHint('Couldn’t understand. Try again.');
-    };
-
-    recognition.onerror = (ev) => {
-      console.warn('[STT] onerror', ev?.error);
-      clearTimeout(watchdogRef.current);
-      setListenHint(ev?.error === 'not-allowed'
-        ? 'Mic blocked. Enable permissions.'
-        : 'Mic error. Try again.');
-      setIsListening(false);
-    };
-
-    recognition.onend = () => {
-      console.log('[STT] onend');
-      clearTimeout(watchdogRef.current);
-      setIsListening(false);
-    };
-
-    return recognition;
-  };
-
+  // ======= Toggle botón (inicia/termina modo continuo) =======
   const toggleListening = async () => {
     if (conversationOver) return;
+    if (listenHint === 'Processing…') return;
 
-    // Si ya está escuchando, paramos
     if (isListening) {
-      recognitionRef.current?.stop();
+      manualStopRef.current = true;
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+      try { recognitionRef.current?.stop(); } catch {}
+      setListenHint('');
       return;
     }
 
-    // 1) cortar cualquier TTS antes de escuchar (evita auto-eco)
-    stopAllAudio();
-
-    // 2) pedir permiso primero
-    const ok = await ensureMicPermission();
-    if (!ok) {
-      alert('We need microphone access to practice speaking.');
-      return;
-    }
-
-    // 3) iniciar STT
-    const rec = initializeSpeechRecognition();
-    recognitionRef.current = rec;
-    if (!rec) return;
-
-    try {
-      setListenHint('Starting microphone…');
-      rec.start(); // isListening se pone true en onstart
-    } catch (e) {
-      console.warn('rec.start() error:', e);
-      setListenHint('Failed to start mic. Try again.');
-    }
+    startContinuousListening();
   };
 
   // ======= Helpers =======
   const highlightErrors = (_original, corrected) =>
-    corrected.replace(/\*\*(.*?)\*\*/g, '<span class="text-red-500 font-semibold">$1</span>');
+    String(corrected || '').replace(/\*\*(.*?)\*\*/g, '<span class="text-red-500 font-semibold">$1</span>');
 
   const generateFeedback = () => {
     const userMessages = messages.filter((m) => m.sender === 'user');
     const allCorrected = userMessages.map((m) => m.text).join(' ');
     setFeedback(allCorrected);
-
     const errors = [];
     const regex = /<span.*?>(.*?)<\/span>/g;
     let match;
     while ((match = regex.exec(allCorrected))) errors.push(match[1]);
-
     setStats({
       totalMessages: userMessages.length,
       totalErrors: errors.length,
@@ -329,10 +428,13 @@ const LiveSession = () => {
 
   const endConversation = () => {
     setConversationOver(true);
+    manualStopRef.current = true;
     setIsListening(false);
+    isListeningRef.current = false;
     clearTimeout(watchdogRef.current);
-    recognitionRef.current?.stop();
-
+    clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = null;
+    try { recognitionRef.current?.stop(); } catch {}
     const goodbye = { sender: 'ai', text: 'Time is up! Let’s continue next time.' };
     setMessages((prev) => [...prev, goodbye]);
     speakText(goodbye.text);
@@ -384,8 +486,6 @@ const LiveSession = () => {
               )}
             </div>
           </div>
-
-          {/* Progress bar */}
           <div className="mt-4 h-2 w-full bg-gray-200 rounded-full overflow-hidden">
             <div
               className="h-2 bg-blue-500 transition-all"
@@ -418,24 +518,28 @@ const LiveSession = () => {
             <div className="flex flex-col items-center justify-center pt-4 gap-1">
               <button
                 onClick={toggleListening}
+                disabled={listenHint === 'Processing…'}
                 className={`p-4 rounded-full shadow-md border transition
                   ${isListening ? 'bg-blue-600 text-white' : 'bg-blue-100 hover:bg-blue-200'}
+                  ${listenHint === 'Processing…' ? 'opacity-50 cursor-not-allowed' : ''}
                 `}
                 aria-label="Microphone"
-                title={isListening ? 'Listening...' : 'Tap to speak'}
+                title={isListening ? 'Listening (continuous)…' : 'Start continuous listening'}
               >
                 {isListening ? '🎙️' : '🎤'}
               </button>
-              {/* pista visual del estado del mic */}
               {listenHint && (
                 <p className="text-xs text-gray-500 mt-1">{listenHint}</p>
+              )}
+              {isListening && (
+                <p className="text-[11px] text-blue-500 mt-1">Continuous mode: silence sends your message</p>
               )}
             </div>
           )}
 
-          {!conversationOver && !listenHint && (
+          {!conversationOver && !listenHint && !isListening && (
             <p className="text-center text-xs text-gray-500 mt-2">
-              {isListening ? 'Listening… speak now' : 'Tap the mic to start speaking'}
+              Tap the mic to start continuous listening
             </p>
           )}
         </div>
@@ -454,13 +558,11 @@ const LiveSession = () => {
                 <span className="text-blue-700">{stats?.totalErrors ?? 0}</span>
               </p>
             </div>
-
             <p className="text-sm font-medium text-gray-700">Grammatical Errors</p>
             <div
               className="bg-blue-50 p-3 rounded-lg text-sm text-gray-800 max-h-40 overflow-y-auto"
               dangerouslySetInnerHTML={{ __html: feedback }}
             />
-
             <button
               onClick={handleStartExercises}
               className="w-full mt-2 bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition"

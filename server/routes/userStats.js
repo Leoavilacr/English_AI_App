@@ -1,135 +1,137 @@
+// server/routes/userStats.js
 const express = require('express');
 const router = express.Router();
-const { PracticeSession } = require('../models');
-const { Op } = require('sequelize');
+const models = require('../models');
+const PracticeSession = models?.PracticeSession;
 
-const getWeekday = (dateStr) => {
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  return days[new Date(dateStr).getDay()];
-};
+// --- util: semana ISO YYYY-WW (tolerante a fechas raras) ---
+function weekKey(d) {
+  const base = d ? new Date(d) : new Date();
+  if (isNaN(base.getTime())) return '0000-00';
+  const tmp = new Date(Date.UTC(base.getFullYear(), base.getMonth(), base.getDate()));
+  const dayNum = tmp.getUTCDay() || 7;
+  tmp.setUTCDate(tmp.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((tmp - yearStart) / 86400000) + 1) / 7);
+  const y = tmp.getUTCFullYear();
+  return `${y}-${String(weekNo).padStart(2, '0')}`;
+}
 
-const getWeekRange = (date) => {
-  const start = new Date(date);
-  start.setDate(start.getDate() - start.getDay());
-  const end = new Date(start);
-  end.setDate(start.getDate() + 6);
-  return `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
-};
-
-router.get('/test', (req, res) => {
-  res.send('✅ userStats.js está funcionando');
+// --- ping rápido para verificar montaje ---
+router.get('/user-stats/ping', (_req, res) => {
+  res.json({ ok: true, hasModel: !!PracticeSession });
 });
 
-router.get('/:googleId', async (req, res) => {
+// Soportamos varias rutas por compatibilidad:
+//  /api/user-stats/:googleId   (oficial)
+//  /api/userstats/:googleId    (alias)
+//  /api/user/:googleId         (alias viejo)
+router.get(['/user-stats/:googleId', '/userstats/:googleId', '/user/:googleId'], async (req, res) => {
   try {
-    const { googleId } = req.params;
-    console.log("📥 Recibido googleId:", googleId);
+    if (!PracticeSession || !PracticeSession.findAll) {
+      console.error('[user-stats] PracticeSession model not loaded. models keys:', Object.keys(models || {}));
+      return res.status(500).json({ error: 'PracticeSession model not loaded' });
+    }
+
+    const googleId = String(req.params.googleId || '').trim();
+    if (!googleId) return res.status(400).json({ error: 'Missing googleId' });
+
+    console.log('[user-stats] GET → googleId:', googleId);
 
     const sessions = await PracticeSession.findAll({
       where: { googleId },
-      order: [['createdAt', 'DESC']],
+      order: [['createdAt', 'DESC']]
     });
-
-    if (!sessions.length) {
-      return res.json({
-        level: 'A1',
-        accuracy: 0,
-        totalSessions: 0,
-        correctAnswers: 0,
-        mistakes: 0,
-        levelProgress: 0,
-        sessionsPerDay: [],
-        weeklyStats: [],
-        levelStats: [],
-        hourlyStats: [],
-        topicStats: []
-      });
-    }
 
     const totalSessions = sessions.length;
-    const correctAnswers = sessions.reduce((sum, s) => sum + s.correct, 0);
-    const mistakes = sessions.reduce((sum, s) => sum + s.mistakes, 0);
-    const accuracy = correctAnswers + mistakes > 0
-      ? Math.round((correctAnswers * 100) / (correctAnswers + mistakes))
-      : 0;
+    const totalCorrect  = sessions.reduce((a, s) => a + (Number(s.correct)   || 0), 0);
+    const totalMistakes = sessions.reduce((a, s) => a + (Number(s.mistakes) || 0), 0);
 
-    const mostRecent = sessions[0];
-    const level = mostRecent.level;
-    const levelProgress = Math.min(100, Math.round((totalSessions / 20) * 100));
-
-    const sessionsPerDayMap = {};
-    const levelMap = {};
-    const hourlyMap = {};
-    const topicMap = {};
-    const weekMap = {};
-
+    // weeklyStats
+    const weeklyMap = new Map();
     sessions.forEach(s => {
-      console.log('🧪 Sesión:', s.toJSON()); // 👈 log del contenido completo de cada sesión
-
-      const day = getWeekday(s.createdAt);
-      sessionsPerDayMap[day] = (sessionsPerDayMap[day] || 0) + 1;
-
-      // Por nivel
-      if (!levelMap[s.level]) levelMap[s.level] = { correct: 0, total: 0 };
-      levelMap[s.level].correct += s.correct;
-      levelMap[s.level].total += s.correct + s.mistakes;
-
-      // Por hora
-      const hour = new Date(s.createdAt).getHours();
-      hourlyMap[hour] = (hourlyMap[hour] || 0) + 1;
-
-      // Por tema
-      if (s.topic) {
-        topicMap[s.topic] = (topicMap[s.topic] || 0) + 1;
-      }
-
-      // Por semana
-      const weekKey = getWeekRange(s.createdAt);
-      if (!weekMap[weekKey]) weekMap[weekKey] = { correct: 0, mistakes: 0 };
-      weekMap[weekKey].correct += s.correct;
-      weekMap[weekKey].mistakes += s.mistakes;
+      const k = weekKey(s.createdAt || s.updatedAt);
+      weeklyMap.set(k, (weeklyMap.get(k) || 0) + 1);
     });
+    const weeklyStats = Array.from(weeklyMap.entries())
+      .map(([week, count]) => ({ week, sessions: count }))
+      .sort((a, b) => a.week.localeCompare(b.week));
 
-    const allDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    const sessionsPerDay = allDays.map(day => ({
-      day,
-      sessions: sessionsPerDayMap[day] || 0,
+    // levelStats
+    const levelAgg = new Map();
+    sessions.forEach(s => {
+      const lvl = s.level || 'Unknown';
+      const agg = levelAgg.get(lvl) || { level: lvl, correct: 0, mistakes: 0, sessions: 0 };
+      agg.correct  += (Number(s.correct) || 0);
+      agg.mistakes += (Number(s.mistakes) || 0);
+      agg.sessions += 1;
+      levelAgg.set(lvl, agg);
+    });
+    const levelStats = Array.from(levelAgg.values()).map(x => ({
+      level: x.level,
+      sessions: x.sessions,
+      accuracy: x.correct + x.mistakes > 0 ? x.correct / (x.correct + x.mistakes) : 0
     }));
 
-    const levelStats = Object.keys(levelMap).map(level => ({
-      level,
-      accuracy: levelMap[level].total > 0 ? Math.round((levelMap[level].correct * 100) / levelMap[level].total) : 0
-    }));
+    // hourlyStats
+    const hourMap = new Map();
+    sessions.forEach(s => {
+      const created = new Date(s.createdAt || s.updatedAt || Date.now());
+      const h = isNaN(created.getTime()) ? 0 : created.getHours();
+      hourMap.set(h, (hourMap.get(h) || 0) + 1);
+    });
+    const hourlyStats = Array.from(hourMap.entries())
+      .map(([hour, count]) => ({ hour, sessions: count }))
+      .sort((a, b) => a.hour - b.hour);
 
-    const hourlyStats = Array.from({ length: 24 }, (_, h) => ({
-      hour: `${h}:00`,
-      sessions: hourlyMap[h] || 0
-    }));
-
-    const topicStats = Object.keys(topicMap).map(topic => ({ topic, count: topicMap[topic] }));
-
-    const weeklyStats = Object.keys(weekMap).map(week => ({
-      week,
-      correct: weekMap[week].correct,
-      mistakes: weekMap[week].mistakes
-    }));
+    // topicStats
+    const topicMap = new Map();
+    sessions.forEach(s => {
+      const t = (s.topic || 'unknown').trim();
+      topicMap.set(t, (topicMap.get(t) || 0) + 1);
+    });
+    const topicStats = Array.from(topicMap.entries())
+      .map(([topic, count]) => ({ topic, sessions: count }))
+      .sort((a, b) => b.sessions - a.sessions);
 
     res.json({
-      level,
-      accuracy,
       totalSessions,
-      correctAnswers,
-      mistakes,
-      levelProgress,
-      sessionsPerDay,
+      totalCorrect,
+      totalMistakes,
       weeklyStats,
       levelStats,
       hourlyStats,
       topicStats
     });
   } catch (err) {
-    console.error('❌ Error en /user-stats:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    // Log hiper detallado para ver el error real
+    console.error('[user-stats] GET error →', err?.message);
+    console.error(err?.stack || err);
+    res.status(500).json({ error: 'Failed to load stats', detail: err?.message || String(err) });
+  }
+});
+
+// (Opcional) endpoint para registrar/actualizar una práctica rápidamente
+router.post('/user-stats/update', async (req, res) => {
+  try {
+    if (!PracticeSession || !PracticeSession.create) {
+      return res.status(500).json({ error: 'PracticeSession model not loaded' });
+    }
+    const { googleId, level, topic, correct = 0, mistakes = 0 } = req.body || {};
+    if (!googleId || !level || !topic) {
+      return res.status(400).json({ error: 'Missing fields (googleId, level, topic)' });
+    }
+    const row = await PracticeSession.create({
+      googleId: String(googleId),
+      level,
+      topic,
+      correct: Number(correct) || 0,
+      mistakes: Number(mistakes) || 0
+    });
+    res.json({ ok: true, id: row.id });
+  } catch (err) {
+    console.error('[user-stats] POST error →', err?.message);
+    res.status(500).json({ error: 'Failed to update stats', detail: err?.message });
   }
 });
 
