@@ -1,37 +1,22 @@
-const { Model, DataTypes } = require('sequelize');
+// server/models/PracticeSession.js
+const { DataTypes } = require('sequelize');
 
-class PracticeSession extends Model {}
+module.exports = (sequelize, InjectedTypes) => {
+  const DT = InjectedTypes || DataTypes;
 
-module.exports = (sequelize) => {
-  PracticeSession.init(
-    {
-      googleId: {
-        type: DataTypes.STRING,
-        allowNull: false,
-      },
-      level: {
-        type: DataTypes.STRING,
-        allowNull: false,
-      },
-      topic: {
-        type: DataTypes.STRING,
-        allowNull: true, // ✅ importante para que no falle si topic es null
-      },
-      correct: {
-        type: DataTypes.INTEGER,
-        defaultValue: 0,
-      },
-      mistakes: {
-        type: DataTypes.INTEGER,
-        defaultValue: 0,
-      },
-    },
-    {
-      sequelize,
-      modelName: 'PracticeSession',
-      timestamps: true, // ✅ asegura que createdAt y updatedAt funcionen
-    }
-  );
+  const PracticeSession = sequelize.define('PracticeSession', {
+    id:        { type: DT.INTEGER.UNSIGNED, primaryKey: true, autoIncrement: true },
+    googleId:  { type: DT.STRING, allowNull: false },
+    level:     { type: DT.STRING(8), allowNull: false },
+    topic:     { type: DT.STRING(64), allowNull: false },
+    correct:   { type: DT.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
+    mistakes:  { type: DT.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 }
+    // ⬆️ Sin startedAt
+  }, {
+    tableName: 'PracticeSessions',
+    timestamps: true,
+    indexes: [{ fields: ['googleId'] }, { fields: ['createdAt'] }]
+  });
 
   return PracticeSession;
 };
