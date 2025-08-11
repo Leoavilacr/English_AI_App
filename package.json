@@ -1,0 +1,19 @@
+{
+  "name": "english-ai-app",
+  "version": "1.0.0",
+  "description": "Full-stack app for learning English through conversational practice.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd server && nodemon server.js",
+    "client": "cd client && npm run dev -- --host"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.0.0"
+  }
+}
