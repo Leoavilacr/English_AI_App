@@ -130,9 +130,17 @@ const StartMenu = ({ user, level, topic, setLevel, setTopic }) => {
 
         {/* Estadísticas del usuario */}
         <div className="mt-6 bg-blue-50 border border-blue-100 rounded-2xl shadow-inner p-6">
-          <h2 className="text-xl font-bold text-blue-800 mb-4">📈 Your Progress</h2>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-bold text-blue-800">📈 Your Progress</h2>
+            {level && (
+              <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-full">
+                Filter: Level {level}
+              </span>
+            )}
+          </div>
           {user?.googleId ? (
-            <UserStats googleId={user.googleId} />
+            // Pasamos el nivel seleccionado para filtrar las estadísticas
+            <UserStats googleId={user.googleId} selectedLevel={level} />
           ) : (
             <p className="text-sm text-gray-500 italic">Loading your stats...</p>
           )}

@@ -1,7 +1,54 @@
-// LiveSession.jsx (continuous listening with auto-start after greeting TTS)
+// LiveSession.jsx (continuous listening + auto-start after greeting TTS)
+// UI: iMessage-like bubbles, improved feedback, back-to-menu after session
+// Update: dynamic mic equalizer (RMS), removed mic button & "Try Again"
+// Added: listening border pulse (animate-pulse-soft)
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useNavigate, useLocation } from 'react-router-dom';
+
+const ListeningIndicator = ({ active, bars }) => {
+  // bars: array de valores 0..1
+  return (
+    <div className="flex flex-col items-center justify-center pt-3 select-none" aria-live="polite">
+      <span className={`text-xs ${active ? 'text-blue-600' : 'text-gray-400'}`}>
+        {active ? 'Listening' : 'Paused'}
+      </span>
+      <div className="flex items-end gap-1.5 h-7 mt-1">
+        {bars.map((v, i) => (
+          <span
+            key={i}
+            className={`${active ? 'bg-blue-600' : 'bg-gray-300'} w-1.5 rounded-sm origin-bottom transition-[height] duration-100`}
+            style={{ height: `${10 + Math.round(v * 18)}px` }} // 10–28px
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const ProcessingDots = ({ show, label = 'Processing' }) => {
+  return (
+    <div className={`flex items-center justify-center gap-2 pt-2 ${show ? '' : 'hidden'}`}>
+      <span className="text-xs text-gray-500">{label}</span>
+      <div className="flex gap-1">
+        {[0,1,2].map((i)=>(
+          <span
+            key={i}
+            className="w-1.5 h-1.5 rounded-full bg-gray-400"
+            style={{ animation: `dot 1.2s ${i*0.15}s infinite` }}
+          />
+        ))}
+      </div>
+      <style>{`
+        @keyframes dot {
+          0%{opacity:.2; transform: translateY(0)}
+          50%{opacity:1; transform: translateY(-3px)}
+          100%{opacity:.2; transform: translateY(0)}
+        }
+      `}</style>
+    </div>
+  );
+};
 
 const LiveSession = () => {
   const { state } = useLocation();
@@ -23,14 +70,102 @@ const LiveSession = () => {
   const timerRef = useRef(null);
   const watchdogRef = useRef(null);
 
+  // ====== Equalizer (RMS) ======
+  const [bars, setBars] = useState([0.3, 0.5, 0.7, 0.55, 0.35]);
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const dataArrayRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const rafRef = useRef(null);
+  const phaseRef = useRef(0);
+
+  const startAudioMeter = useCallback(async () => {
+    try {
+      // Evita duplicados
+      if (audioCtxRef.current || micStreamRef.current) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+      micStreamRef.current = stream;
+
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      audioCtxRef.current = ctx;
+
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
+      const bufferLength = analyser.fftSize;
+      const dataArray = new Uint8Array(bufferLength);
+      dataArrayRef.current = dataArray;
+
+      source.connect(analyser);
+
+      const animate = () => {
+        if (!analyserRef.current || !dataArrayRef.current) return;
+
+        analyserRef.current.getByteTimeDomainData(dataArrayRef.current);
+
+        // RMS 0..1 (aprox)
+        let sum = 0;
+        for (let i = 0; i < dataArrayRef.current.length; i++) {
+          const v = (dataArrayRef.current[i] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / dataArrayRef.current.length); // ~0-0.35 hablando normal
+        const level = Math.min(1, rms * 3.2); // escala
+
+        // Genera 5 barras con fase para que no sean iguales
+        phaseRef.current += 0.12;
+        const base = [0, 1, 2, 3, 4].map(i => {
+          const wobble = (Math.sin(phaseRef.current + i * 0.9) + 1) / 2; // 0..1
+          const val = 0.15 + (level * 0.75 + wobble * 0.35) / 1.6;        // mezcla
+          return Math.max(0, Math.min(1, val));
+        });
+        setBars(base);
+
+        rafRef.current = requestAnimationFrame(animate);
+      };
+      rafRef.current = requestAnimationFrame(animate);
+    } catch (e) {
+      console.warn('Audio meter error:', e);
+      // Si falla, mantenemos barras pasivas
+    }
+  }, []);
+
+  const stopAudioMeter = useCallback(async () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+
+    try {
+      if (audioCtxRef.current) {
+        await audioCtxRef.current.close();
+      }
+    } catch {}
+    audioCtxRef.current = null;
+
+    try {
+      micStreamRef.current?.getTracks()?.forEach(t => t.stop());
+    } catch {}
+    micStreamRef.current = null;
+
+    analyserRef.current = null;
+    dataArrayRef.current = null;
+
+    // Barras en estado "reposo"
+    setBars([0.25, 0.35, 0.45, 0.33, 0.22]);
+  }, []);
+
   // Continuous STT buffers y timers
-  const continuousMode = true;               // 👈 modo continuo habilitado
-  const SILENCE_MS = 1000;                   // umbral de silencio para "enviar"
+  const continuousMode = true;
+  const SILENCE_MS = 2000;
   const silenceTimerRef = useRef(null);
-  const partialRef = useRef('');             // última transcripción parcial
-  const finalRef = useRef('');               // acumulado final de la frase actual
-  const lastSentRef = useRef('');            // para deduplicar
-  const sendingRef = useRef(false);          // evita overlaps de requests
+  const partialRef = useRef('');
+  const finalRef = useRef('');
+  const lastSentRef = useRef('');
+  const sendingRef = useRef(false);
 
   const normalize = (s) =>
     String(s || '')
@@ -39,14 +174,14 @@ const LiveSession = () => {
       .replace(/\s+/g, ' ')
       .trim();
 
-  // --- Auto-start después del TTS de bienvenida ---
+  // Auto-start mic tras TTS de bienvenida
   const autoStartAfterGreetingRef = useRef(false);
 
-  // --- Audio (cola simple para evitar solapes) ---
+  // Audio (cola)
   const audioRef = useRef(null);
   const queueRef = useRef([]);
   const isPlayingRef = useRef(false);
-  const pausedByTTSRef = useRef(false);      // si pausamos el mic por TTS
+  const pausedByTTSRef = useRef(false);
 
   const durations = { A1: 300, A2: 360, B1: 420, B2: 480, C1: 600 };
   const totalDuration = durations[level] || 300;
@@ -57,7 +192,7 @@ const LiveSession = () => {
     if (!isListeningRef.current) return;
     try {
       pausedByTTSRef.current = true;
-      recognitionRef.current.stop();
+      recognitionRef.current.stop(); // onend -> isListening=false -> detiene meter por efecto
     } catch {}
   }, []);
 
@@ -87,12 +222,13 @@ const LiveSession = () => {
     }
   }, []);
 
-  // ======= START continuo (función reutilizable) =======
+  // ======= START continuo (sin botón) =======
   const ensureMicPermission = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true }
       });
+      // cerramos porque solo era para permiso; el meter abrirá su propio stream
       stream.getTracks().forEach(t => t.stop());
       return true;
     } catch (e) {
@@ -109,17 +245,16 @@ const LiveSession = () => {
     }
     const recognition = new SpeechRecognition();
     recognition.lang = 'en-US';
-    recognition.interimResults = true;    // parciales activos
+    recognition.interimResults = true;
     recognition.maxAlternatives = 1;
-    recognition.continuous = true;        // modo continuo
+    recognition.continuous = true;
 
     recognition.onstart = () => {
       setListenHint('Listening…');
-      setIsListening(true);
+      setIsListening(true);          // <- activa equalizer por efecto
       isListeningRef.current = true;
       manualStopRef.current = false;
       clearTimeout(watchdogRef.current);
-      // watchdog de 20s sin eventos para reiniciar
       watchdogRef.current = setTimeout(() => {
         try { recognition.stop(); } catch {}
       }, 20000);
@@ -161,14 +296,14 @@ const LiveSession = () => {
       }
       setListenHint(ev?.error === 'not-allowed'
         ? 'Mic blocked. Enable permissions.'
-        : 'Mic error. Tap again.');
-      setIsListening(false);
+        : 'Mic error.');
+      setIsListening(false);         // <- pausa equalizer
       isListeningRef.current = false;
     };
 
     recognition.onend = () => {
       clearTimeout(watchdogRef.current);
-      setIsListening(false);
+      setIsListening(false);         // <- pausa equalizer
       isListeningRef.current = false;
       if (continuousMode && !manualStopRef.current && !conversationOver) {
         try { recognition.start(); } catch {}
@@ -199,18 +334,17 @@ const LiveSession = () => {
       rec.start();
     } catch (e) {
       console.warn('rec.start() error:', e);
-      setListenHint('Failed to start mic. Try again.');
+      setListenHint('Failed to start mic.');
     }
   }, [conversationOver, listenHint, stopAllAudio, initializeSpeechRecognition]);
 
-  // ======= Reproducción de audio (con auto-start tras bienvenida) =======
+  // ======= Reproducción de audio =======
   const playNextInQueue = useCallback(() => {
     if (isPlayingRef.current) return;
     const next = queueRef.current.shift();
     if (!next) return;
 
     isPlayingRef.current = true;
-    // pausa el mic antes de reproducir para evitar eco
     pauseRecognitionForTTS();
 
     audioRef.current = new Audio(next);
@@ -218,12 +352,10 @@ const LiveSession = () => {
       URL.revokeObjectURL(next);
       isPlayingRef.current = false;
 
-      // Si venimos del saludo inicial y aún no hay mic, arráncalo
       if (autoStartAfterGreetingRef.current) {
         autoStartAfterGreetingRef.current = false;
         startContinuousListening();
       } else {
-        // si ya estaba el mic y lo pausamos, reanudar
         resumeRecognitionAfterTTS();
       }
 
@@ -258,7 +390,6 @@ const LiveSession = () => {
       playNextInQueue();
     } catch (e) {
       console.error('TTS error:', e);
-      // aunque falle TTS, si esperábamos auto-start, lánzalo
       if (autoStartAfterGreetingRef.current) {
         autoStartAfterGreetingRef.current = false;
         startContinuousListening();
@@ -268,7 +399,7 @@ const LiveSession = () => {
     }
   }, [playNextInQueue, resumeRecognitionAfterTTS, startContinuousListening]);
 
-  // ======= Mensaje inicial (StrictMode-safe) + auto-start tras TTS =======
+  // ======= Mensaje inicial + auto-start mic =======
   useEffect(() => {
     if (!level || !topic) return;
     if (hasWelcomedRef.current) return;
@@ -301,7 +432,6 @@ const LiveSession = () => {
         if (cancelled) return;
 
         setMessages(prev => (prev.length ? prev : [{ sender: 'ai', text: aiText }]));
-        // marcar que, al terminar este TTS, auto-arranque el mic continuo
         autoStartAfterGreetingRef.current = true;
         speakText(aiText);
         setTimeLeft(totalDuration);
@@ -337,7 +467,17 @@ const LiveSession = () => {
     return () => clearInterval(timerRef.current);
   }, [isListening, conversationOver]);
 
-  // ======= Commit de la frase cuando hay silencio =======
+  // ======= Equalizer lifecycle ligado a isListening =======
+  useEffect(() => {
+    if (isListening) {
+      startAudioMeter();
+    } else {
+      stopAudioMeter();
+    }
+    return () => { stopAudioMeter(); };
+  }, [isListening, startAudioMeter, stopAudioMeter]);
+
+  // ======= Commit de la frase =======
   const commitUtterance = useCallback(async () => {
     clearTimeout(silenceTimerRef.current);
     silenceTimerRef.current = null;
@@ -379,50 +519,73 @@ const LiveSession = () => {
       finalRef.current = '';
       partialRef.current = '';
 
-      // Reproduce TTS (pausa/reanuda mic según corresponda)
       speakText(aiText);
       setListenHint('');
     } catch (e) {
       console.error('Chat fetch error:', e);
-      setListenHint('Network error. Try again.');
+      setListenHint('Network error.');
     } finally {
       sendingRef.current = false;
     }
   }, [googleId, level, topic, sessionId, speakText]);
 
-  // ======= Toggle botón (inicia/termina modo continuo) =======
-  const toggleListening = async () => {
-    if (conversationOver) return;
-    if (listenHint === 'Processing…') return;
-
-    if (isListening) {
-      manualStopRef.current = true;
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-      try { recognitionRef.current?.stop(); } catch {}
-      setListenHint('');
-      return;
-    }
-
-    startContinuousListening();
-  };
-
   // ======= Helpers =======
   const highlightErrors = (_original, corrected) =>
     String(corrected || '').replace(/\*\*(.*?)\*\*/g, '<span class="text-red-500 font-semibold">$1</span>');
+
+  const analyzeErrors = (htmlJoined) => {
+    const regex = /<span.*?>(.*?)<\/span>/g;
+    const freq = new Map();
+    let match;
+    while ((match = regex.exec(htmlJoined))) {
+      const key = match[1].trim().toLowerCase();
+      if (!key) continue;
+      freq.set(key, (freq.get(key) || 0) + 1);
+    }
+
+    const patterns = Array.from(freq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([text, count]) => ({ text, count }));
+
+    const tips = getTipsFromPatterns(patterns);
+
+    return {
+      totalErrors: Array.from(freq.values()).reduce((a, b) => a + b, 0),
+      patterns,
+      tips
+    };
+  };
+
+  const getTipsFromPatterns = (patterns) => {
+    const tips = [];
+    const hasArticleIssues = patterns.some(p => /\b(a|an|the)\b/.test(p.text));
+    const hasVerb3rd = patterns.some(p => /\b(go|do|want|like|need|have|be)\b/.test(p.text));
+    const hasPreps = patterns.some(p => /\b(in|on|at|to|for|with|from|of)\b/.test(p.text));
+    const hasPlural = patterns.some(p => /s$/.test(p.text) || /\b(is|are)\b/.test(p.text));
+    const hasPast = patterns.some(p => /\b(did|was|were|went|had|said|made|took)\b/.test(p.text));
+
+    if (hasArticleIssues) tips.push('Articles (a/an/the): usa **a** antes de consonante sonora, **an** antes de sonido vocal, y **the** para algo específico ya conocido.');
+    if (hasVerb3rd) tips.push('3rd person singular: en presente simple con **he/she/it**, agrega **-s** al verbo (e.g., *she likes*, *he goes*).');
+    if (hasPreps) tips.push('Preposiciones comunes: **in** (meses/años/lugares cerrados), **on** (días/fechas/superficie), **at** (horas/lugar exacto).');
+    if (hasPlural) tips.push('Plural y concordancia: revisa **is/are** y termina en **-s** cuando el sustantivo es plural.');
+    if (hasPast) tips.push('Pasado simple: verbos regulares en **-ed**; irregulares memorizados (*go → went*, *have → had*).');
+
+    if (tips.length === 0) tips.push('¡Buen trabajo! Tus errores son variados y menores. Enfócate en pronunciación clara y frases cortas y correctas.');
+    return tips.slice(0, 3);
+  };
 
   const generateFeedback = () => {
     const userMessages = messages.filter((m) => m.sender === 'user');
     const allCorrected = userMessages.map((m) => m.text).join(' ');
     setFeedback(allCorrected);
-    const errors = [];
-    const regex = /<span.*?>(.*?)<\/span>/g;
-    let match;
-    while ((match = regex.exec(allCorrected))) errors.push(match[1]);
+
+    const analysis = analyzeErrors(allCorrected);
     setStats({
       totalMessages: userMessages.length,
-      totalErrors: errors.length,
-      errors
+      totalErrors: analysis.totalErrors,
+      patterns: analysis.patterns,
+      tips: analysis.tips
     });
   };
 
@@ -443,9 +606,13 @@ const LiveSession = () => {
 
   const navigate = useNavigate();
   const handleStartExercises = () => {
-    if (stats?.errors?.length) {
-      navigate('/exercises', { state: { errors: stats.errors, level, topic } });
+    if (stats?.totalErrors > 0) {
+      const errorsOnly = (stats.patterns || []).map(p => p.text);
+      navigate('/exercises', { state: { errors: errorsOnly, level, topic } });
     }
+  };
+  const handleBackToMenu = () => {
+    navigate('/menu'); // o '/start-menu' si aplica
   };
 
   if (!level || !topic) {
@@ -459,6 +626,8 @@ const LiveSession = () => {
   }
 
   // ======= UI =======
+  const listeningActive = isListening && listenHint !== 'Processing…';
+
   return (
     <div className="min-h-screen bg-gradient-to-tr from-blue-100 to-blue-200 py-8 px-4">
       <div className="w-full max-w-3xl mx-auto space-y-6">
@@ -494,81 +663,153 @@ const LiveSession = () => {
           </div>
         </div>
 
-        {/* Conversation Card */}
-        <div className="bg-white rounded-2xl shadow-2xl p-5 border border-gray-200">
-          <div className="space-y-3 text-sm max-h-[48vh] overflow-y-auto pr-1">
-            {messages.map((msg, idx) => (
-              <div
-                key={idx}
-                className={`rounded-xl px-4 py-3 ${
-                  msg.sender === 'ai'
-                    ? 'bg-blue-50 border border-blue-100'
-                    : 'bg-gray-50 border border-gray-200'
-                }`}
-              >
-                <span className="block font-medium mb-1">
-                  {msg.sender === 'ai' ? 'AI:' : 'You:'}
-                </span>
-                <span dangerouslySetInnerHTML={{ __html: msg.text }} />
-              </div>
-            ))}
+        {/* Conversation Card (con latido cuando escucha) */}
+        <div className={`bg-white rounded-2xl shadow-2xl p-5 border ${listeningActive ? 'border-blue-400 animate-pulse-soft' : 'border-gray-200'}`}>
+          {/* keyframes para el pulso */}
+          <style>{`
+            @keyframes pulse-soft {
+              0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.40); }
+              50%      { box-shadow: 0 0 0 8px rgba(59, 130, 246, 0.00); }
+            }
+            .animate-pulse-soft { animation: pulse-soft 1.8s ease-in-out infinite; }
+          `}</style>
+
+          <div className="space-y-2 text-sm max-h-[48vh] overflow-y-auto pr-1">
+            {messages.map((msg, idx) => {
+              const isAI = msg.sender === 'ai';
+              return (
+                <div
+                  key={idx}
+                  className={`flex ${isAI ? 'justify-start' : 'justify-end'}`}
+                >
+                  <div
+                    className={[
+                      'relative px-4 py-3 shadow-sm',
+                      'max-w-[80%]',
+                      isAI
+                        ? 'bg-green-100 text-green-900 border border-green-200 rounded-2xl rounded-bl-sm'
+                        : 'bg-blue-100 text-blue-900 border border-blue-200 rounded-2xl rounded-br-sm'
+                    ].join(' ')}
+                  >
+                    <span className="block text-[11px] font-semibold mb-1 opacity-70">
+                      {isAI ? 'AI' : 'You'}
+                    </span>
+                    <span
+                      className="leading-relaxed"
+                      dangerouslySetInnerHTML={{ __html: msg.text }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
           </div>
 
+          {/* Indicadores (sin botón) */}
           {!conversationOver && (
-            <div className="flex flex-col items-center justify-center pt-4 gap-1">
-              <button
-                onClick={toggleListening}
-                disabled={listenHint === 'Processing…'}
-                className={`p-4 rounded-full shadow-md border transition
-                  ${isListening ? 'bg-blue-600 text-white' : 'bg-blue-100 hover:bg-blue-200'}
-                  ${listenHint === 'Processing…' ? 'opacity-50 cursor-not-allowed' : ''}
-                `}
-                aria-label="Microphone"
-                title={isListening ? 'Listening (continuous)…' : 'Start continuous listening'}
-              >
-                {isListening ? '🎙️' : '🎤'}
-              </button>
-              {listenHint && (
-                <p className="text-xs text-gray-500 mt-1">{listenHint}</p>
-              )}
-              {isListening && (
-                <p className="text-[11px] text-blue-500 mt-1">Continuous mode: silence sends your message</p>
-              )}
-            </div>
-          )}
-
-          {!conversationOver && !listenHint && !isListening && (
-            <p className="text-center text-xs text-gray-500 mt-2">
-              Tap the mic to start continuous listening
-            </p>
+            <>
+              <ListeningIndicator
+                active={listeningActive}
+                bars={bars}
+              />
+              <ProcessingDots show={listenHint === 'Processing…'} />
+            </>
           )}
         </div>
 
         {/* Feedback Card */}
         {conversationOver && (
-          <div className="bg-white rounded-2xl shadow-2xl p-5 border border-gray-200 space-y-4">
-            <h3 className="text-lg font-semibold text-gray-800">Feedback</h3>
-            <div className="flex flex-wrap items-center gap-4 text-sm">
-              <p>
-                <strong className="text-gray-700">Messages:</strong>{' '}
-                <span className="text-blue-700">{stats?.totalMessages ?? 0}</span>
-              </p>
-              <p>
-                <strong className="text-gray-700">Detected Errors:</strong>{' '}
-                <span className="text-blue-700">{stats?.totalErrors ?? 0}</span>
-              </p>
+          <div className="bg-white rounded-2xl shadow-2xl p-5 border border-gray-200 space-y-5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-gray-800">Session Feedback</h3>
+              <span className="text-xs text-gray-500">
+                Level {level} · Topic <span className="capitalize">{topic}</span>
+              </span>
             </div>
-            <p className="text-sm font-medium text-gray-700">Grammatical Errors</p>
-            <div
-              className="bg-blue-50 p-3 rounded-lg text-sm text-gray-800 max-h-40 overflow-y-auto"
-              dangerouslySetInnerHTML={{ __html: feedback }}
-            />
-            <button
-              onClick={handleStartExercises}
-              className="w-full mt-2 bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition"
-            >
-              Start Exercises
-            </button>
+
+            {/* KPIs */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="bg-blue-50 rounded-xl p-3 text-center">
+                <div className="text-xs text-gray-500">Messages</div>
+                <div className="text-xl font-bold text-blue-800">{stats?.totalMessages ?? 0}</div>
+              </div>
+              <div className="bg-blue-50 rounded-xl p-3 text-center">
+                <div className="text-xs text-gray-500">Detected Errors</div>
+                <div className="text-xl font-bold text-blue-800">{stats?.totalErrors ?? 0}</div>
+              </div>
+              <div className="bg-blue-50 rounded-xl p-3 text-center">
+                <div className="text-xs text-gray-500">Accuracy (est.)</div>
+                <div className="text-xl font-bold text-blue-800">
+                  {stats?.totalMessages
+                    ? Math.max(0, Math.round(100 - (100 * (stats?.totalErrors || 0)) / (stats?.totalMessages * 4)))
+                    : 100}%{/* estimación simple */}
+                </div>
+              </div>
+              <div className="bg-blue-50 rounded-xl p-3 text-center">
+                <div className="text-xs text-gray-500">Focus Next</div>
+                <div className="text-sm font-semibold text-blue-800">
+                  {stats?.patterns?.[0]?.text || 'Fluency'}
+                </div>
+              </div>
+            </div>
+
+            {/* Top errores */}
+            {stats?.patterns?.length > 0 && (
+              <div>
+                <p className="text-sm font-medium text-gray-700 mb-2">Top mistakes to review</p>
+                <ul className="space-y-2">
+                  {stats.patterns.map((p, i) => (
+                    <li
+                      key={i}
+                      className="flex items-start justify-between gap-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2"
+                    >
+                      <span className="text-gray-800">
+                        <span className="font-semibold text-blue-800">{p.text}</span>
+                      </span>
+                      <span className="text-xs px-2 py-1 rounded bg-blue-100 text-blue-800">
+                        {p.count}×
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Tips accionables */}
+            {stats?.tips?.length > 0 && (
+              <div>
+                <p className="text-sm font-medium text-gray-700 mb-2">Actionable tips</p>
+                <ul className="list-disc ml-5 space-y-1 text-sm text-gray-800">
+                  {stats.tips.map((t, i) => (
+                    <li key={i}>{t}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Texto con correcciones in-line */}
+            <div>
+              <p className="text-sm font-medium text-gray-700 mb-2">Your sentences with corrections</p>
+              <div
+                className="bg-blue-50 p-3 rounded-lg text-sm text-gray-800 max-h-40 overflow-y-auto"
+                dangerouslySetInnerHTML={{ __html: feedback }}
+              />
+            </div>
+
+            {/* Acciones finales */}
+            <div className="grid sm:grid-cols-2 gap-3">
+              <button
+                onClick={handleStartExercises}
+                className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition"
+              >
+                Start Exercises
+              </button>
+              <button
+                onClick={handleBackToMenu}
+                className="w-full bg-white text-gray-700 border border-gray-200 py-2 rounded-lg hover:bg-gray-50 transition"
+              >
+                Back to Menu
+              </button>
+            </div>
           </div>
         )}
       </div>

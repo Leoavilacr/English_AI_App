@@ -6,6 +6,7 @@ const cors = require('cors');
 const session = require('express-session');
 const SequelizeStore = require('connect-session-sequelize')(session.Store);
 const passport = require('passport');
+const userStatsRouter = require('./routes/userStats');
 
 const db = require('./models'); // usa models/index.js (Sequelize + modelos)
 const sequelize = db.sequelize;
@@ -48,14 +49,23 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // ---------- Rutas ----------
+// Auth (Google OAuth, etc.)
 app.use('/auth', require('./routes/auth'));
+
+// API propias
 app.use('/api', require('./routes/chat'));
-app.use('/api', require('./routes/userStats')); // si no la tienes, quita esta línea
-app.use('/api', require('./routes/sessions'));
-app.use('/api', require('./routes/tts'));
+//app.use('/api', require('./routes/userStats')); // si no la tienes, comenta esta línea
+app.use('/api', require('./routes/api'));       // 👈 AQUI el router que expone /sessionViewer y alias /sessions
+app.use('/api', require('./routes/tts'));       // si no la tienes, comenta esta línea
+app.use('/api/user-stats', userStatsRouter);
 
 // (Opcional) ping de salud
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// 404 JSON por defecto (después de todas las rutas)
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not Found', path: req.originalUrl });
+});
 
 // ---------- Arranque ----------
 (async () => {

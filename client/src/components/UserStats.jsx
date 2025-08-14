@@ -1,30 +1,63 @@
-// UserStats.jsx
+// UserStats.jsx (sin barras + gráficos extra)
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  PieChart, Pie, Cell,
-  LineChart, Line, XAxis, YAxis, Tooltip,
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
+  AreaChart, Area, CartesianGrid, ReferenceLine,
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
-  ResponsiveContainer
+  PieChart, Pie, Cell
 } from 'recharts';
 
-const COLORS = ['#3B82F6', '#93C5FD', '#8B5CF6', '#34D399', '#F59E0B', '#F87171', '#6366F1', '#F43F5E'];
-
-// Usa VITE_API_BASE si existe; si no, llama directo al backend local para evitar 404 sin proxy
+const PALETTE = {
+  blue: '#3B82F6',
+  blueSoft: '#93C5FD',
+  indigo: '#6366F1',
+  indigoSoft: '#A5B4FC',
+  green: '#34D399',
+  amber: '#F59E0B',
+  red: '#F87171',
+  gray400: '#9CA3AF',
+  grid: '#E5E7EB'
+};
 const API_BASE = (import.meta.env?.VITE_API_BASE ?? 'http://localhost:3001');
 
-const UserStats = ({ googleId }) => {
+const fmtPct = (v) => (v == null ? '-' : `${Number(v).toFixed(0)}%`);
+const fmtWeekStr = (w) => {
+  if (!w) return '';
+  const s = String(w);
+  return `${s.slice(0, 4)}·W${s.slice(4)}`;
+};
+
+const EmptyState = ({ text = 'No data yet.' }) => (
+  <div className="flex items-center justify-center h-40 text-sm text-gray-400 italic">{text}</div>
+);
+
+const NiceTooltip = ({ active, payload, label, mode }) => {
+  if (!active || !payload || !payload.length) return null;
+  const val = payload[0].value;
+  return (
+    <div className="bg-white/95 backdrop-blur shadow px-3 py-2 rounded-lg border border-gray-200 text-xs">
+      {mode === 'week' && <div className="font-medium text-gray-700 mb-1">{fmtWeekStr(label)}</div>}
+      {mode === 'hour' && <div className="font-medium text-gray-700 mb-1">{label}:00</div>}
+      {mode === 'topic' && <div className="font-medium text-gray-700 mb-1">{label}</div>}
+      <div className="text-gray-600">{mode === 'count' ? val : fmtPct(val)}</div>
+    </div>
+  );
+};
+
+const UserStats = ({ googleId, selectedLevel }) => {
   const [stats, setStats] = useState(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
     let aborted = false;
-
     const fetchStats = async () => {
       try {
         setError('');
         if (!googleId) return;
         const encodedId = encodeURIComponent(String(googleId));
-        const res = await fetch(`${API_BASE}/api/user-stats/${encodedId}`, { credentials: 'include' });
+        const url = new URL(`${API_BASE}/api/user-stats/${encodedId}`);
+        if (selectedLevel) url.searchParams.set('level', selectedLevel);
+        const res = await fetch(url.toString(), { credentials: 'include' });
         if (!res.ok) throw new Error('Failed to fetch stats');
         const json = await res.json();
         if (!aborted) setStats(json);
@@ -33,214 +66,242 @@ const UserStats = ({ googleId }) => {
         if (!aborted) setError('Could not load your stats right now.');
       }
     };
-
     fetchStats();
     return () => { aborted = true; };
-  }, [googleId]);
+  }, [googleId, selectedLevel]);
 
-  // Derivados para UI (mapean lo que entrega el backend a lo que necesita el UI)
   const derived = useMemo(() => {
     if (!stats) return null;
 
-    const {
-      totalSessions = 0,
-      totalCorrect = 0,
-      totalMistakes = 0,
-      weeklyStats = [],      // [{ week: '2025-30', sessions: 3 }]
-      levelStats = [],       // [{ level:'A1', sessions: n, accuracy: 0..1 }]
-      hourlyStats = [],      // [{ hour: 13, sessions: 2 }]
-      topicStats = []        // [{ topic:'travel', sessions: 5 }]
-    } = stats;
+    // KPIs
+    const currentStreak = stats.kpis?.currentStreak ?? 0;
+    const bestStreak = stats.kpis?.bestStreak ?? 0;
+    const last7dSessions = stats.kpis?.last7dSessions ?? 0;
+    const rolling4wAccuracyPct = stats.kpis?.rolling4wAccuracyPct ?? 0;
 
-    const attempts = totalCorrect + totalMistakes;
-    const accuracyPct = attempts > 0 ? Math.round((totalCorrect / attempts) * 100) : 0;
+    // Series del backend nuevo
+    const weeklyAccuracy = (stats.weeklyAccuracy ?? []).map(d => ({ ...d, label: fmtWeekStr(d.week) }));
+    const hourlyAccuracy = stats.hourlyAccuracy ?? [];
+    const topicAccuracy = (stats.topicAccuracy ?? []).slice().sort((a, b) => a.accPct - b.accPct);
+    const xpWeekly = stats.xpProgressWeekly ?? [];
+    const levelComparative = stats.levelComparative ?? [];
 
-    // Nivel más practicado
-    const topLevel = levelStats.length
-      ? levelStats.reduce((a, b) => (b.sessions > a.sessions ? b : a)).level
-      : 'A1';
-
-    // Progreso “gamificado” hacia siguiente nivel (heurística simple por nº de sesiones)
-    const levelProgress = totalSessions > 0 ? Math.min(100, Math.round((totalSessions % 20) * (100 / 20))) : 0;
-
-    // Sessions por semana para line chart
-    const sessionsPerWeek = weeklyStats.map(w => ({ week: w.week, sessions: w.sessions || 0 }));
-
-    // Accuracy por nivel en %
-    const radarLevelStats = levelStats.map(x => ({
+    // Radar comparativo por nivel
+    const radarLevelStats = levelComparative.map(x => ({
       level: x.level,
-      accuracy: Math.round((x.accuracy || 0) * 100)
+      accuracy: Math.round((x.acc || 0) * 100)
     }));
 
-    // Topic stats: usa `sessions` (no `count`)
-    const pieTopics = topicStats.map(t => ({ topic: t.topic, sessions: t.sessions || 0 }));
+    // Progreso mixto por nivel activo
+    const WEIGHTS = { perSession: 3, accFactor: 0.4, cap: 100 };
+    const levelSessions = stats.levelSessions ?? 0;
+    const levelAccuracyPct = stats.levelAccuracyPct ?? 0;
+    const mixedProgress = (levelSessions * WEIGHTS.perSession) + (levelAccuracyPct * WEIGHTS.accFactor);
+    const levelProgress = Math.min(WEIGHTS.cap, Math.round(mixedProgress));
+    const activeLevel = selectedLevel || (radarLevelStats[0]?.level ?? 'A1');
+
+    // Sparkline últimas 4 semanas
+    const spark = weeklyAccuracy.slice(-4);
+
+    // Para radar por temas: convertir a {topic, value}
+    const radarTopics = topicAccuracy.map(t => ({ topic: t.topic || '—', value: t.accPct || 0 }));
 
     return {
-      totalSessions,
-      totalCorrect,
-      totalMistakes,
-      accuracyPct,
-      topLevel,
-      levelProgress,
-      sessionsPerWeek,
+      kpis: { currentStreak, bestStreak, last7dSessions, rolling4wAccuracyPct },
+      weeklyAccuracy,
+      hourlyAccuracy,
+      radarTopics,
+      xpWeekly,
       radarLevelStats,
-      hourlyStats,
-      pieTopics
+      levelProgress,
+      levelSessions,
+      levelAccuracyPct,
+      activeLevel,
+      spark
     };
-  }, [stats]);
+  }, [stats, selectedLevel]);
 
-  if (error) {
-    return <p className="text-sm text-red-500">{error}</p>;
-  }
-
-  if (!derived) {
-    return <p className="text-sm text-gray-500">Loading progress...</p>;
-  }
+  if (error) return <p className="text-sm text-red-500">{error}</p>;
+  if (!derived) return <p className="text-sm text-gray-500">Loading progress...</p>;
 
   const {
-    totalSessions,
-    totalCorrect,
-    totalMistakes,
-    accuracyPct,
-    topLevel,
-    levelProgress,
-    sessionsPerWeek,
-    radarLevelStats,
-    hourlyStats,
-    pieTopics
+    kpis, weeklyAccuracy, hourlyAccuracy, radarTopics, xpWeekly,
+    radarLevelStats, levelProgress, levelSessions, levelAccuracyPct, activeLevel, spark
   } = derived;
 
   const pieData = [
-    { name: 'Correct Answers', value: totalCorrect },
-    { name: 'Mistakes', value: totalMistakes }
+    { name: 'Accuracy', value: levelAccuracyPct, color: PALETTE.indigo },
+    { name: 'Miss', value: Math.max(0, 100 - levelAccuracyPct), color: PALETTE.gray400 }
   ];
 
   return (
     <div className="space-y-6">
-      {/* Nivel + progreso */}
-      <div className="bg-white rounded-xl shadow p-4">
-        <h3 className="font-bold text-blue-800 text-sm mb-1">Your Progress</h3>
-        <div className="flex justify-between items-center mb-1">
-          <p className="text-sm text-blue-600 font-medium">Level {topLevel}</p>
-          {totalSessions >= 20 && (
-            <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">🔥 {totalSessions} Sessions</span>
-          )}
+      {/* Header */}
+      {/* KPI cards con sparkline */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <p className="text-xs text-gray-500">Current Streak</p>
+          <p className="text-2xl font-bold text-blue-800">{kpis.currentStreak} days</p>
         </div>
-        <div className="w-full bg-gray-200 h-2 rounded-full mb-1">
-          <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${levelProgress}%` }} />
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <p className="text-xs text-gray-500">Best Streak</p>
+          <p className="text-2xl font-bold text-blue-800">{kpis.bestStreak} days</p>
         </div>
-        <p className="text-xs text-right text-gray-400">{levelProgress}% to next level</p>
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <p className="text-xs text-gray-500">Sessions (last 7d)</p>
+          <p className="text-2xl font-bold text-blue-800">{kpis.last7dSessions}</p>
+        </div>
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs text-gray-500">Accuracy (rolling 4w)</p>
+              <p className="text-2xl font-bold text-blue-800">{fmtPct(kpis.rolling4wAccuracyPct)}</p>
+            </div>
+            {/* Sparkline */}
+            <div className="w-24 h-10">
+              {spark.length ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={spark}>
+                    <Line type="monotone" dataKey="accPct" stroke={PALETTE.blue} strokeWidth={2} dot={false} />
+                    <YAxis hide domain={[0, 100]} />
+                    <XAxis hide />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : null}
+            </div>
+          </div>
+        </div>
       </div>
 
-      {/* Gráficos en grid */}
+      {/* Progreso mixto + donut */}
+      <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+        <div className="flex justify-between items-center mb-2">
+          <h3 className="font-bold text-blue-800 text-sm">Your Progress</h3>
+          <span className="text-xs bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full">
+            🔥 {levelProgress}% Progress
+          </span>
+        </div>
+        <div className="w-full bg-gray-200 h-2 rounded-full mb-2" aria-label="progress bar">
+          <div className="bg-gradient-to-r from-blue-500 to-indigo-500 h-2 rounded-full" style={{ width: `${levelProgress}%` }} />
+        </div>
+        <div className="flex justify-between text-xs text-gray-400 mb-3">
+          <span>Level {activeLevel} · Sessions: {levelSessions}</span>
+          <span>{levelProgress}% to next level</span>
+        </div>
+
+        <div className="flex items-center gap-6">
+          <div className="w-28 h-28">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={pieData} cx="50%" cy="50%" innerRadius={32} outerRadius={44} dataKey="value" paddingAngle={2}>
+                  {pieData.map((d, i) => <Cell key={i} fill={d.color} />)}
+                </Pie>
+                <Tooltip content={<NiceTooltip mode="pct" />} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="text-sm text-gray-600">
+            <p><span className="font-semibold text-blue-700">Accuracy Level {activeLevel}:</span> {fmtPct(levelAccuracyPct)}</p>
+            <p className="text-xs text-gray-500 mt-1">Progreso mixto = sesiones*3 + accuracy%*0.4 (cap 100)</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Gráficos (sin barras) */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Accuracy */}
-        <div className="bg-white rounded-xl shadow p-4 flex flex-col items-center justify-center">
-          <p className="text-3xl font-bold text-blue-800">{accuracyPct}%</p>
-          <p className="text-sm text-gray-600 mb-2">Accuracy</p>
-          <ResponsiveContainer width="100%" height={120}>
-            <PieChart>
-              <Pie
-                data={pieData}
-                cx="50%" cy="50%" innerRadius={25} outerRadius={40}
-                dataKey="value" paddingAngle={2}
-              >
-                {pieData.map((_, i) => (
-                  <Cell key={i} fill={COLORS[i % COLORS.length]} />
-                ))}
-              </Pie>
-              <Tooltip />
-            </PieChart>
-          </ResponsiveContainer>
-          <p className="text-xs text-gray-500 mt-2">
-            Attempts: {totalCorrect + totalMistakes} &middot; Sessions: {totalSessions}
-          </p>
+        {/* Accuracy per Week → AreaChart */}
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <h3 className="font-semibold text-blue-700 text-sm mb-2">Accuracy per Week</h3>
+          {weeklyAccuracy.length ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={weeklyAccuracy}>
+                <defs>
+                  <linearGradient id="gAccWeek" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={PALETTE.blue} stopOpacity={0.35} />
+                    <stop offset="100%" stopColor={PALETTE.blue} stopOpacity={0.05} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke={PALETTE.grid} strokeDasharray="3 3" />
+                <XAxis dataKey="week" tickFormatter={fmtWeekStr} tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <YAxis domain={[0, 100]} tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <ReferenceLine y={75} stroke={PALETTE.green} strokeDasharray="4 4" />
+                <Tooltip content={<NiceTooltip mode="week" />} />
+                <Area type="monotone" dataKey="accPct" stroke={PALETTE.blue} strokeWidth={2} fill="url(#gAccWeek)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="No weekly accuracy yet." />}
         </div>
 
-        {/* Sessions per Week */}
-        <div className="bg-white rounded-xl shadow p-4">
-          <h3 className="font-semibold text-blue-700 text-sm mb-2">Sessions per Week</h3>
-          <ResponsiveContainer width="100%" height={140}>
-            <LineChart data={sessionsPerWeek}>
-              <XAxis dataKey="week" />
-              <YAxis allowDecimals={false} />
-              <Tooltip />
-              <Line type="monotone" dataKey="sessions" stroke="#3B82F6" strokeWidth={2} />
-            </LineChart>
-          </ResponsiveContainer>
+        {/* Accuracy by Hour → AreaChart */}
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <h3 className="font-semibold text-blue-700 text-sm mb-2">Accuracy by Hour</h3>
+          {hourlyAccuracy.length ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={hourlyAccuracy}>
+                <defs>
+                  <linearGradient id="gAccHour" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={PALETTE.indigo} stopOpacity={0.35} />
+                    <stop offset="100%" stopColor={PALETTE.indigo} stopOpacity={0.05} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke={PALETTE.grid} strokeDasharray="3 3" />
+                <XAxis dataKey="hour" tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <YAxis domain={[0, 100]} tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <ReferenceLine y={75} stroke={PALETTE.green} strokeDasharray="4 4" />
+                <Tooltip content={<NiceTooltip mode="hour" />} />
+                <Area type="monotone" dataKey="accPct" stroke={PALETTE.indigo} strokeWidth={2} fill="url(#gAccHour)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="No hourly accuracy yet." />}
         </div>
 
-        {/* Accuracy per level */}
-        <div className="bg-white rounded-xl shadow p-4">
-          <h3 className="font-semibold text-blue-700 text-sm mb-2">Accuracy per Level</h3>
-          {radarLevelStats.length ? (
-            <ResponsiveContainer width="100%" height={180}>
-              <RadarChart data={radarLevelStats}>
+        {/* Topic Accuracy → Radar por tema */}
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <h3 className="font-semibold text-blue-700 text-sm mb-2">Topic Accuracy (Radar)</h3>
+          {radarTopics.length ? (
+            <ResponsiveContainer width="100%" height={260}>
+              <RadarChart data={radarTopics}>
                 <PolarGrid />
-                <PolarAngleAxis dataKey="level" />
-                <Radar name="Accuracy" dataKey="accuracy" stroke="#6366F1" fill="#6366F1" fillOpacity={0.6} />
-                <Tooltip />
+                <PolarAngleAxis dataKey="topic" tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <Radar name="Accuracy" dataKey="value" stroke={PALETTE.blue} fill={PALETTE.blueSoft} fillOpacity={0.5} />
+                <Tooltip content={<NiceTooltip mode="topic" />} />
               </RadarChart>
             </ResponsiveContainer>
-          ) : (
-            <p className="text-sm text-gray-400 italic">No level data yet.</p>
-          )}
+          ) : <EmptyState text="No topics practiced yet." />}
+          <p className="text-xs text-gray-500 mt-2">Tip: trabaja primero los radios más cortos (temas con menor %).</p>
         </div>
 
-        {/* Hourly stats */}
-        <div className="bg-white rounded-xl shadow p-4">
-          <h3 className="font-semibold text-blue-700 text-sm mb-2">Sessions by Hour</h3>
-          {hourlyStats.length ? (
-            <ResponsiveContainer width="100%" height={150}>
-              <LineChart data={hourlyStats}>
-                <XAxis dataKey="hour" />
-                <YAxis allowDecimals={false} />
-                <Tooltip />
-                <Line type="monotone" dataKey="sessions" stroke="#3B82F6" strokeWidth={2} />
+        {/* XP Progress → dos líneas */}
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <h3 className="font-semibold text-blue-700 text-sm mb-2">XP Progress</h3>
+          {xpWeekly.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={xpWeekly}>
+                <CartesianGrid stroke={PALETTE.grid} strokeDasharray="3 3" />
+                <XAxis dataKey="week" tickFormatter={fmtWeekStr} tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <YAxis allowDecimals={false} tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <Tooltip content={<NiceTooltip mode="count" />} />
+                <Line type="monotone" dataKey="xp" name="XP (weekly)" stroke={PALETTE.blue} strokeWidth={2} dot={{ r: 3 }} />
+                <Line type="monotone" dataKey="xpCumulative" name="XP (cumulative)" stroke={PALETTE.indigo} strokeWidth={2} dot={{ r: 3 }} />
               </LineChart>
             </ResponsiveContainer>
-          ) : (
-            <p className="text-sm text-gray-400 italic">No hourly data yet.</p>
-          )}
+          ) : <EmptyState text="No XP yet." />}
+          <p className="text-xs text-gray-500 mt-2">XP = sesiones*3 + accuracy%*0.4, acumulado muestra tu tendencia.</p>
         </div>
 
-        {/* Topic stats */}
-        <div className="bg-white rounded-xl shadow p-4">
-          <h3 className="font-semibold text-blue-700 text-sm mb-2">Sessions by Topic</h3>
-          {pieTopics.length > 0 ? (
-            <>
-              <div className="w-full h-48">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={pieTopics}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={40}
-                      outerRadius={60}
-                      paddingAngle={2}
-                      dataKey="sessions"
-                      nameKey="topic"
-                    >
-                      {pieTopics.map((entry, index) => (
-                        <Cell key={`cell-topic-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="text-center text-xs text-gray-500 mt-2">
-                {pieTopics.map((entry, index) => (
-                  <span key={index} className="mr-3">
-                    <span style={{ color: COLORS[index % COLORS.length] }}>●</span> {entry.topic}
-                  </span>
-                ))}
-              </div>
-            </>
-          ) : (
-            <p className="text-sm text-gray-400 italic">No topic data available yet.</p>
-          )}
+        {/* Accuracy per Level (Radar comparativo) */}
+        <div className="bg-white rounded-2xl shadow p-4 border border-gray-100">
+          <h3 className="font-semibold text-blue-700 text-sm mb-2">Accuracy per Level</h3>
+          {radarLevelStats.length ? (
+            <ResponsiveContainer width="100%" height={240}>
+              <RadarChart data={radarLevelStats}>
+                <PolarGrid />
+                <PolarAngleAxis dataKey="level" tick={{ fill: PALETTE.gray400, fontSize: 12 }} />
+                <Radar name="Accuracy" dataKey="accuracy" stroke={PALETTE.indigo} fill={PALETTE.indigoSoft} fillOpacity={0.6} />
+                <Tooltip content={<NiceTooltip mode="pct" />} />
+              </RadarChart>
+            </ResponsiveContainer>
+          ) : <EmptyState text="No level data yet." />}
         </div>
       </div>
     </div>
